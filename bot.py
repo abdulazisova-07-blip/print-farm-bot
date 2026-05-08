@@ -10,7 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 import aiosqlite
 
 # ---------- НАСТРОЙКИ ----------
-TOKEN = "8785273956:AAF8mdNuhjeM2Onrbqs0xeG3fYG-arQNI9k"         # Токен бота
+TOKEN = "8785273956:AAF8mdNuhjeM2Onrbqs0xeG3fYG-arQNI9k" # Токен бота
 ARTEM_ID = 1172985519             # ID Telegram Артема
 BAZA_ID = 987654321                # ID Telegram Базы
 
@@ -45,26 +45,35 @@ async def init_db():
                 FOREIGN KEY(printer_id) REFERENCES printers(id)
             )
         """)
-        # Склад коробок (каждая запись – отдельная коробка)
+        # Склад деталей (текущее количество)
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS boxes (
+            CREATE TABLE IF NOT EXISTS parts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT NOT NULL,
+                code TEXT UNIQUE NOT NULL,
                 name TEXT,
-                quantity INTEGER NOT NULL,
-                user_id INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                quantity_packed INTEGER DEFAULT 0
             )
         """)
-        # Лог отгрузок (какие коробки отгружены)
+        # Лог упаковок
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS packing_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                part_id INTEGER,
+                user_id INTEGER,
+                qty_added INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(part_id) REFERENCES parts(id)
+            )
+        """)
+        # Лог отгрузок (обнуление количества)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS shipments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT,
-                name TEXT,
-                quantity INTEGER,
+                part_id INTEGER,
                 user_id INTEGER,
-                shipped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                qty_shipped INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(part_id) REFERENCES parts(id)
             )
         """)
         await db.commit()
@@ -73,6 +82,9 @@ async def init_db():
 class PrinterBreak(StatesGroup):
     waiting_for_number = State()
     waiting_for_reason = State()
+
+class PrinterReturn(StatesGroup):
+    waiting_for_selection = State()
 
 class PartAdd(StatesGroup):
     waiting_for_code = State()
@@ -84,6 +96,10 @@ class AdminAddPrinter(StatesGroup):
 
 class AdminRemovePrinter(StatesGroup):
     waiting_for_number = State()
+
+class AdminShipPart(StatesGroup):
+    waiting_for_code = State()
+    waiting_for_qty = State()  # для частичной отгрузки
 
 class AdminStatHistory(StatesGroup):
     waiting_for_printer_number = State()
@@ -110,20 +126,25 @@ async def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 async def add_printer_to_db(number: str) -> bool:
-    """Добавляет принтер в реестр, если его ещё нет."""
+    """Добавляет принтер в реестр, если его ещё нет. Возвращает True, если добавлен."""
     async with aiosqlite.connect(DB_NAME) as db:
         try:
             await db.execute("INSERT INTO printers (number, status) VALUES (?, 'работает')", (number,))
             await db.commit()
             return True
         except aiosqlite.IntegrityError:
-            return False
+            return False  # уже существует
 
 async def get_printer_id_by_number(number: str) -> int | None:
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute("SELECT id FROM printers WHERE number = ? AND status != 'снят'", (number,))
         row = await cursor.fetchone()
         return row[0] if row else None
+
+async def set_printer_status(number: str, status: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE printers SET status = ? WHERE number = ?", (status, number))
+        await db.commit()
 
 # ---------- ОБРАБОТЧИКИ КОМАНД ----------
 async def start_command(message: Message):
@@ -140,10 +161,10 @@ async def break_number(message: Message, state: FSMContext):
     number = message.text.strip()
     printer_id = await get_printer_id_by_number(number)
     if not printer_id:
-        await message.answer(
-            "❌ Принтер с таким номером не найден в системе. Обратитесь к администратору.",
-            reply_markup=main_menu(message.from_user.id)   # ← теперь с меню
-        )
+        # возможно, принтер не в реестре – разрешим добавлять только админам?
+        # По логике, оператор не может ломать не зарегистрированный принтер.
+        # Но чтобы не усложнять, добавим проверку: если номер не найден, сообщим об этом.
+        await message.answer("❌ Принтер с таким номером не найден в системе. Обратитесь к администратору.")
         await state.clear()
         return
     await state.update_data(printer_id=printer_id, number=number)
@@ -158,10 +179,12 @@ async def break_reason(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
     async with aiosqlite.connect(DB_NAME) as db:
+        # Создаём запись о поломке
         await db.execute(
             "INSERT INTO breakdowns (printer_id, reason, reported_by) VALUES (?, ?, ?)",
             (printer_id, reason, user_id)
         )
+        # Меняем статус принтера на 'сломан'
         await db.execute("UPDATE printers SET status = 'сломан' WHERE id = ?", (printer_id,))
         await db.commit()
 
@@ -172,6 +195,7 @@ async def break_reason(message: Message, state: FSMContext):
 # ---------- ВЕРНУТЬ В РАБОТУ ----------
 async def menu_return(callback: CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
+        # Получаем список сломаных принтеров с незакрытыми поломками
         cursor = await db.execute("""
             SELECT p.number, b.id, b.reason, b.reported_at
             FROM printers p
@@ -188,6 +212,7 @@ async def menu_return(callback: CallbackQuery):
 
     kb = InlineKeyboardBuilder()
     for number, breakdown_id, reason, reported_at in rows:
+        # Форматируем кнопку
         date_str = datetime.strptime(reported_at, "%Y-%m-%d %H:%M:%S").strftime("%d.%m %H:%M") if reported_at else "?"
         btn_text = f"#{number} — {reason} ({date_str})"
         kb.button(text=btn_text, callback_data=f"return_{breakdown_id}")
@@ -201,6 +226,7 @@ async def return_printer(callback: CallbackQuery):
     user_id = callback.from_user.id
 
     async with aiosqlite.connect(DB_NAME) as db:
+        # Получаем printer_id для этой поломки
         cursor = await db.execute("SELECT printer_id FROM breakdowns WHERE id = ?", (breakdown_id,))
         row = await cursor.fetchone()
         if not row:
@@ -208,17 +234,17 @@ async def return_printer(callback: CallbackQuery):
             return
         printer_id = row[0]
 
+        # Закрываем поломку
         await db.execute("UPDATE breakdowns SET resolved_at = CURRENT_TIMESTAMP, resolved_by = ? WHERE id = ?",
                          (user_id, breakdown_id))
+        # Обновляем статус принтера
         await db.execute("UPDATE printers SET status = 'работает' WHERE id = ?", (printer_id,))
+        # Получаем номер принтера для ответа
         cursor = await db.execute("SELECT number FROM printers WHERE id = ?", (printer_id,))
         number = (await cursor.fetchone())[0]
         await db.commit()
 
-    await callback.message.edit_text(
-        f"✅ Принтер #{number} снова в строю! Спасибо за починку.",
-        reply_markup=main_menu(callback.from_user.id)   # ← теперь с меню
-    )
+    await callback.message.edit_text(f"✅ Принтер #{number} снова в строю! Спасибо за починку.")
     await callback.answer("Принтер возвращён в работу.")
 
 # ---------- СПИСОК НЕРАБОТАЮЩИХ ----------
@@ -246,7 +272,7 @@ async def menu_list_broken(callback: CallbackQuery):
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu(callback.from_user.id))
     await callback.answer()
 
-# ---------- ДОБАВИТЬ УПАКОВАННЫЕ ДЕТАЛИ (КОРОБКУ) ----------
+# ---------- ДОБАВИТЬ УПАКОВАННЫЕ ДЕТАЛИ ----------
 async def menu_add_part(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Введите код детали (артикул):")
     await state.set_state(PartAdd.waiting_for_code)
@@ -261,7 +287,7 @@ async def part_code(message: Message, state: FSMContext):
 async def part_name(message: Message, state: FSMContext):
     name = message.text.strip()
     await state.update_data(name=name)
-    await message.answer("Введите количество штук в коробке:")
+    await message.answer("Введите количество упакованных штук:")
     await state.set_state(PartAdd.waiting_for_qty)
 
 async def part_qty(message: Message, state: FSMContext):
@@ -279,24 +305,35 @@ async def part_qty(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT INTO boxes (code, name, quantity, user_id) VALUES (?, ?, ?, ?)",
-            (code, name, qty, user_id)
-        )
+        # Ищем деталь по коду
+        cursor = await db.execute("SELECT id, quantity_packed FROM parts WHERE code = ?", (code,))
+        row = await cursor.fetchone()
+        if row:
+            part_id, current_qty = row
+            new_qty = current_qty + qty
+            await db.execute("UPDATE parts SET quantity_packed = ? WHERE id = ?", (new_qty, part_id))
+        else:
+            # Создаём новую деталь
+            cursor = await db.execute("INSERT INTO parts (code, name, quantity_packed) VALUES (?, ?, ?)",
+                                      (code, name, qty))
+            part_id = cursor.lastrowid
+        # Логируем упаковку
+        await db.execute("INSERT INTO packing_log (part_id, user_id, qty_added) VALUES (?, ?, ?)",
+                         (part_id, user_id, qty))
         await db.commit()
 
-    await message.answer(
-        f"✅ Коробка добавлена: {code} - {name}, {qty} шт.",
-        reply_markup=main_menu(user_id)
-    )
+    await message.answer(f"✅ Добавлено: {code} - {name}, +{qty} шт. На складе: {new_qty if row else qty}.",
+                         reply_markup=main_menu(user_id))
     await state.clear()
 
 # ---------- АДМИНКА: СТАТИСТИКА ПРИНТЕРОВ ----------
 async def menu_stats(callback: CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
+        # 1. Количество сломанных сейчас
         cursor = await db.execute("SELECT COUNT(*) FROM printers WHERE status = 'сломан'")
         broken_now = (await cursor.fetchone())[0]
 
+        # 2. Топ-5 проблемных принтеров (по количеству поломок за всё время)
         cursor = await db.execute("""
             SELECT p.number, COUNT(b.id) as cnt
             FROM breakdowns b
@@ -383,72 +420,109 @@ async def remove_printer_number(message: Message, state: FSMContext):
             await message.answer(f"✅ Принтер #{number} снят с производства.", reply_markup=main_menu(message.from_user.id))
     await state.clear()
 
-# ---------- АДМИНКА: ПРОСМОТР БАЗЫ ДЕТАЛЕЙ (СПИСОК КОРОБОК) ----------
+# ---------- АДМИНКА: ПРОСМОТР БАЗЫ ДЕТАЛЕЙ ----------
 async def menu_parts_list(callback: CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute(
-            "SELECT code, name, quantity, created_at FROM boxes ORDER BY created_at DESC"
-        )
+        cursor = await db.execute("SELECT code, name, quantity_packed FROM parts ORDER BY code")
         rows = await cursor.fetchall()
 
     if not rows:
-        await callback.message.edit_text("📦 На складе нет коробок.", reply_markup=main_menu(callback.from_user.id))
+        await callback.message.edit_text("📦 Склад пуст.", reply_markup=main_menu(callback.from_user.id))
         await callback.answer()
         return
 
-    text = "📋 **Список коробок на складе:**\n\n"
-    for code, name, qty, created in rows:
-        date_str = created[:16] if created else "?"
-        text += f"`{code}` — {name}, {qty} шт. (добавлена {date_str})\n"
+    text = "📋 **Текущие складские остатки:**\n\n"
+    for code, name, qty in rows:
+        text += f"`{code}` — {name}: {qty} шт.\n"
 
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu(callback.from_user.id))
     await callback.answer()
 
-# ---------- АДМИНКА: ОТГРУЗКА (ВЫБОР КОРОБКИ) ----------
+# ---------- АДМИНКА: ОЧИСТИТЬ ОТГРУЖЕННЫЕ ----------
 async def menu_ship(callback: CallbackQuery):
+    # Сразу предлагаем список деталей с кнопками для отгрузки
     async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute(
-            "SELECT id, code, name, quantity FROM boxes ORDER BY created_at DESC"
-        )
-        boxes = await cursor.fetchall()
+        cursor = await db.execute("SELECT id, code, name, quantity_packed FROM parts WHERE quantity_packed > 0")
+        parts = await cursor.fetchall()
 
-    if not boxes:
-        await callback.message.edit_text("🚚 Нет коробок для отгрузки.", reply_markup=main_menu(callback.from_user.id))
+    if not parts:
+        await callback.message.edit_text("🚚 Нет деталей для отгрузки (склад пуст).",
+                                         reply_markup=main_menu(callback.from_user.id))
         await callback.answer()
         return
 
     kb = InlineKeyboardBuilder()
-    for box_id, code, name, qty in boxes:
-        kb.button(text=f"{code} — {name} ({qty} шт.)", callback_data=f"ship_box_{box_id}")
+    for part_id, code, name, qty in parts:
+        kb.button(text=f"{code} ({qty} шт.) - всё", callback_data=f"ship_all_{part_id}")
+        kb.button(text=f"{code} - частично", callback_data=f"ship_part_{part_id}")
     kb.button(text="🔙 Назад", callback_data="back_to_main")
-    kb.adjust(1)
-    await callback.message.edit_text("Выберите коробку для отгрузки:", reply_markup=kb.as_markup())
+    kb.adjust(2)
+    await callback.message.edit_text("Выберите деталь для отгрузки:", reply_markup=kb.as_markup())
     await callback.answer()
 
-async def ship_box(callback: CallbackQuery):
-    box_id = int(callback.data.split("_")[2])
+async def ship_all(callback: CallbackQuery):
+    part_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
 
     async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT code, name, quantity FROM boxes WHERE id = ?", (box_id,))
-        box = await cursor.fetchone()
-        if not box:
-            await callback.answer("Ошибка: коробка не найдена.", show_alert=True)
+        cursor = await db.execute("SELECT code, name, quantity_packed FROM parts WHERE id = ?", (part_id,))
+        part = await cursor.fetchone()
+        if not part:
+            await callback.answer("Ошибка: деталь не найдена.", show_alert=True)
             return
-        code, name, qty = box
-
-        await db.execute(
-            "INSERT INTO shipments (code, name, quantity, user_id) VALUES (?, ?, ?, ?)",
-            (code, name, qty, user_id)
-        )
-        await db.execute("DELETE FROM boxes WHERE id = ?", (box_id,))
+        code, name, qty = part
+        # Логируем отгрузку
+        await db.execute("INSERT INTO shipments (part_id, user_id, qty_shipped) VALUES (?, ?, ?)",
+                         (part_id, user_id, qty))
+        # Обнуляем
+        await db.execute("UPDATE parts SET quantity_packed = 0 WHERE id = ?", (part_id,))
         await db.commit()
 
-    await callback.message.edit_text(
-        f"✅ Коробка отгружена: {code} — {name}, {qty} шт.",
-        reply_markup=main_menu(callback.from_user.id)
-    )
-    await callback.answer("Коробка удалена со склада.")
+    await callback.message.edit_text(f"✅ Деталь {code} ({name}) отгружена полностью: {qty} шт.",
+                                     reply_markup=main_menu(user_id))
+    await callback.answer()
+
+async def ship_part_start(callback: CallbackQuery, state: FSMContext):
+    part_id = int(callback.data.split("_")[2])
+    await state.update_data(part_id=part_id)
+    await callback.message.edit_text("Введите количество, которое хотите отгрузить:")
+    await state.set_state(AdminShipPart.waiting_for_qty)
+    await callback.answer()
+
+async def ship_part_qty(message: Message, state: FSMContext):
+    try:
+        qty = int(message.text)
+        if qty <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите положительное целое число.")
+        return
+
+    data = await state.get_data()
+    part_id = data["part_id"]
+    user_id = message.from_user.id
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute("SELECT code, name, quantity_packed FROM parts WHERE id = ?", (part_id,))
+        part = await cursor.fetchone()
+        if not part:
+            await message.answer("❌ Деталь не найдена.", reply_markup=main_menu(user_id))
+            await state.clear()
+            return
+        code, name, current_qty = part
+        if qty > current_qty:
+            await message.answer(f"❌ Недостаточно на складе. Доступно: {current_qty} шт.")
+            return
+
+        new_qty = current_qty - qty
+        await db.execute("UPDATE parts SET quantity_packed = ? WHERE id = ?", (new_qty, part_id))
+        await db.execute("INSERT INTO shipments (part_id, user_id, qty_shipped) VALUES (?, ?, ?)",
+                         (part_id, user_id, qty))
+        await db.commit()
+
+    await message.answer(f"✅ Отгружено: {code} - {name}, {qty} шт. Осталось: {new_qty}.",
+                         reply_markup=main_menu(user_id))
+    await state.clear()
 
 # ---------- УНИВЕРСАЛЬНЫЙ ВОЗВРАТ В ГЛАВНОЕ МЕНЮ ----------
 async def back_to_main(callback: CallbackQuery):
@@ -468,33 +542,48 @@ async def main():
     bot = Bot(token=TOKEN)
     dp = Dispatcher()
 
+    # Команда /start
     dp.message.register(start_command, Command("start"))
 
+    # Обработчики меню (callback)
     dp.callback_query.register(menu_break, F.data == "menu_break")
     dp.callback_query.register(menu_return, F.data == "menu_return")
     dp.callback_query.register(menu_list_broken, F.data == "menu_list_broken")
     dp.callback_query.register(menu_add_part, F.data == "menu_add_part")
     dp.callback_query.register(back_to_main, F.data == "back_to_main")
 
+    # Админские меню
     dp.callback_query.register(menu_stats, F.data == "menu_stats", admin_only_filter)
     dp.callback_query.register(menu_add_printer, F.data == "menu_add_printer", admin_only_filter)
     dp.callback_query.register(menu_remove_printer, F.data == "menu_remove_printer", admin_only_filter)
     dp.callback_query.register(menu_parts_list, F.data == "menu_parts_list", admin_only_filter)
     dp.callback_query.register(menu_ship, F.data == "menu_ship", admin_only_filter)
 
+    # Возврат принтера в работу
     dp.callback_query.register(return_printer, F.data.startswith("return_"))
-    dp.callback_query.register(ship_box, F.data.startswith("ship_box_"), admin_only_filter)
+    # Отгрузка
+    dp.callback_query.register(ship_all, F.data.startswith("ship_all_"), admin_only_filter)
+    dp.callback_query.register(ship_part_start, F.data.startswith("ship_part_"), admin_only_filter)
+    # История поломок
     dp.callback_query.register(stat_history_start, F.data == "stat_history", admin_only_filter)
 
+    # FSM: Сломался принтер
     dp.message.register(break_number, PrinterBreak.waiting_for_number)
     dp.message.register(break_reason, PrinterBreak.waiting_for_reason)
+    # FSM: Добавление детали
     dp.message.register(part_code, PartAdd.waiting_for_code)
     dp.message.register(part_name, PartAdd.waiting_for_name)
     dp.message.register(part_qty, PartAdd.waiting_for_qty)
+    # FSM: Админ - добавление принтера
     dp.message.register(add_printer_number, AdminAddPrinter.waiting_for_number)
+    # FSM: Админ - снятие принтера
     dp.message.register(remove_printer_number, AdminRemovePrinter.waiting_for_number)
+    # FSM: Админ - история
     dp.message.register(stat_history_show, AdminStatHistory.waiting_for_printer_number)
+    # FSM: Админ - частичная отгрузка
+    dp.message.register(ship_part_qty, AdminShipPart.waiting_for_qty)
 
+    # Периодическая задача: поддержание WebSocket (для Render)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
