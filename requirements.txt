@@ -1,2 +1,5 @@
 aiogram
 aiosqlite
+openpyxl
+flask
+gunicorn
